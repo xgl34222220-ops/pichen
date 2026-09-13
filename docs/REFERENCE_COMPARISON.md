@@ -123,3 +123,25 @@ KernelSU 的 module 命令会进入 PID 1 的挂载命名空间，因此不能�
 - 不把 APK 有文件当作已交付；交付必须提供可下载 APK、模块 ZIP、可复现源码及摘要，并说明签名是否能覆盖安装已有 APK。
 
 本对照研究没有复制上述项目源码或产品素材。实际分发的第三方规则及许可另见 `module/THIRD_PARTY_NOTICES.md`；保护模式与联网设置由用户在 App 中选择。
+
+
+## 7. 2026-09-13 补充对照及本轮落实
+
+本轮重新读取 bindhosts、AdAway、Re-Malwack、RethinkDNS 官方仓库，并扩展到下列方案；
+研究范围是代表性技术路线，不宣称穷尽全部商业产品、模块、闭源变体或当前所有版本。
+原有表格中的历史记录与本轮代码落实应分别阅读，未实际移植的功能不能列入产品功能清单。
+
+| 补充方案 | 官方出处与本次确认 | 本轮取舍 |
+| --- | --- | --- |
+| personalDNSfilter | [官方配置](https://github.com/IngoZenz/personaldnsfilter/blob/master/app/src/main/assets/dnsfilter.conf) 明确包含 CNAME cloaking 检查 | 自行实现有边界的查询关联 CNAME 链检查，不复制引擎代码；默认关闭以便逐步验证 |
+| AdGuard Home / DNS | [官方说明](https://adguard-dns.io/en/welcome.html) 说明请求和响应都可参与 CNAME 防绕过 | 请求名与响应目标分别检查，保留显式白名单；不宣传为完整 AdGuard 内容过滤 |
+| 10007_auto | [官方仓库](https://github.com/lingeringsound/10007_auto) 提供自动更新广告 hosts | 借鉴模块独立维护思路；暂未内置其规则，不能写成已移植所有规则 |
+| GKD | [官方仓库](https://github.com/gkd-kit/gkd) 使用无障碍、高级选择器和订阅规则做自定义屏幕点击 | 作为“控件/开屏处理”的独立路线评估，本轮没有加入无障碍自动点击，也不把 DNS 拦截说成已跳过开屏 |
+| anti-AD | [官方仓库](https://github.com/privacy-protection-tools/anti-AD) 发布多格式域名规则，并区分可能争议或影响业务的域名 | 规则格式与误拦须单独评估，本轮未盲目叠加到默认列表 |
+| AdRules | [官方仓库](https://github.com/Cats-Team/AdRules) 面向多种过滤器提供不同规则格式 | 不将 Adblock URL/例外语义剥掉后转为 hosts；本轮不把其全部规则加入 |
+| 秋风 AWAvenue | [官方仓库](https://github.com/TG-Twilight/AWAvenue-Ads-Rule) 提供广告过滤规则与多平台使用方式 | 保留已内置的纯广告来源；隐私跟踪源仍独立选择 |
+| Blokada | [官方仓库](https://github.com/blokadaorg/blokada) 覆盖本地及云端产品路线 | 借鉴保护状态与控制入口；本轮不增加云端账号、日志收集或付费代理依赖 |
+
+直接落实的是 Re-Malwack 式档位选择的交互思想、personalDNSfilter/AdGuard 的响应别名检查方向，
+以及查询活动到误拦恢复的操作链路。所有新代码为本轮独立实现；没有直接复制参考项目源码。
+档位复用辟尘已有四个来源，并非这些项目规则的并集；新增来源仍须逐份核对许可证、格式和误拦。

@@ -80,6 +80,7 @@ public final class ModuleInstaller {
                     actual.getBytes(StandardCharsets.US_ASCII))) {
                 throw new IOException("内置模块完整性校验失败，已停止安装");
             }
+            ModuleArchive.verify(temporary, info.optString("version"), info.optInt("versionCode", -1));
             File destination = new File(directory, "Bichen-" + info.optString("version") + "-module.zip");
             if (!temporary.renameTo(destination)) throw new IOException("无法保存已校验的模块包");
             completed = true;

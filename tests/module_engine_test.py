@@ -130,6 +130,29 @@ class ModuleEngineTests(unittest.TestCase):
         self.run_cli("boot")
         self.assertFalse(self.run_cli("status")["mounted"])
 
+    def test_profile_import_preserves_lists_pause_and_one_step_rollback(self):
+        # The App's preset operation uses the same atomic import-settings entry.
+        self.run_cli("add-allow", "business.example")
+        self.run_cli("add-block", "custom.ads.example")
+        self.run_cli("pause")
+        before = self.run_cli("export-config")
+        generation = self.current()
+        allow = self.file("profile-allow.txt", "business.example\n")
+        block = self.file("profile-block.txt", "custom.ads.example\n")
+        self.run_cli("import-settings", allow, block, "1", "1", "0", "1")
+        after = self.run_cli("export-config")
+        self.assertEqual(before["allow"], after["allow"])
+        self.assertEqual(before["block"], after["block"])
+        self.assertEqual((self.snapshot() / "parent").read_text().strip(), generation)
+        self.assertFalse(self.run_cli("status")["enabled"])
+        self.assertFalse(self.run_cli("status")["mounted"])
+        self.run_cli("rollback")
+        restored = self.run_cli("export-config")
+        self.assertEqual(before["sources"], restored["sources"])
+        self.assertEqual(before["allow"], restored["allow"])
+        self.assertEqual(before["block"], restored["block"])
+        self.assertFalse(self.run_cli("status")["mounted"])
+
     def test_shell_input_is_data_and_does_not_execute(self):
         marker = self.root / "injected"
         payload = "$(touch " + str(marker) + ").example"

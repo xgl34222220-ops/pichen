@@ -139,7 +139,7 @@ public final class DnsPacket {
         return result;
     }
 
-    private static int nameEnd(byte[] dns, int position) {
+    static int nameEnd(byte[] dns, int position) {
         int p = position, end = -1, length = 1, steps = 0;
         while (p < dns.length && ++steps <= 128) {
             int at = p, n = dns[p++] & 255;

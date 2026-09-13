@@ -5,10 +5,17 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.content.Intent;
+import android.content.Context;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.pm.ServiceInfo;
 import android.net.VpnService;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
+import android.net.LinkProperties;
+import java.net.Proxy;
+import javax.net.ssl.HttpsURLConnection;
 import android.os.Build;
 import android.os.ParcelFileDescriptor;
 import android.system.OsConstants;
@@ -47,6 +54,7 @@ public final class DnsVpnService extends VpnService {
     public static final String ACTION_RELOAD = "io.github.xgl34222220.bichen.VPN_RELOAD";
     public static volatile boolean running;
     private static final Object MODE_LOCK = new Object();
+    private static final Object LOGS_LOCK = new Object();
     private static volatile DnsVpnService latestInstance;
     private static final String CHANNEL = "dns_protection";
     private static final int NOTIFICATION_ID = 101;
@@ -54,13 +62,16 @@ public final class DnsVpnService extends VpnService {
     private RuleStore rules;
     private final ExecutorService lifecycle = Executors.newSingleThreadExecutor();
     private final ScheduledExecutorService statistics = Executors.newSingleThreadScheduledExecutor();
-    private final Set<Closeable> sockets = Collections.newSetFromMap(new ConcurrentHashMap<Closeable, Boolean>());
+    private final ConcurrentHashMap<Closeable, Long> sockets = new ConcurrentHashMap<>();
+    private final NetworkEpoch<Network> networkState = new NetworkEpoch<>();
+    private ConnectivityManager connectivity;
+    private volatile ConnectivityManager.NetworkCallback networkCallback;
     private final AtomicInteger generation = new AtomicInteger();
     private final AtomicInteger commandSequence = new AtomicInteger();
     private final AtomicLong queries = new AtomicLong(), blocked = new AtomicLong(), errors = new AtomicLong();
     private final AtomicLong cacheHits = new AtomicLong(), fallbackCount = new AtomicLong(), latencyMs = new AtomicLong();
     private final DnsCache cache = new DnsCache();
-    private final Object outputLock = new Object(), logsLock = new Object();
+    private final Object outputLock = new Object();
     private volatile ParcelFileDescriptor tunnel;
     private volatile FileOutputStream output;
     private volatile ThreadPoolExecutor workers;
@@ -158,16 +169,122 @@ public final class DnsVpnService extends VpnService {
         workers = new ThreadPoolExecutor(2, 4, 30, TimeUnit.SECONDS, new ArrayBlockingQueue<>(64));
         activeUpstream = configuredUpstream;
         activeTransport = transport; activeDohProvider = provider;
-        encryptedUpstream = "doh".equals(transport) ? new DnsUpstream() : null;
+        encryptedUpstream = null; // Created only after the default physical network is known.
         cache.clear();
         int token = generation.incrementAndGet();
         networkRunning = true; running = true;
         prefs.edit().remove("vpnError").remove("dnsLastError").putInt("activeBypassCount", excludedCount)
                 .putStringSet("activeBypassApps", activeExcluded).putString("activeDnsTransport", transport)
                 .putString("activeDohProvider", provider).apply();
-        showForeground("DNS 防护已开启 · 普通网络流量直接连接");
+        startNetworkMonitor(token);
+        showForeground("DNS 防护已开启 · 正在确认上游网络");
         Thread reader = new Thread(() -> readPackets(established, token), "bichen-dns-tun");
         reader.setDaemon(true); reader.start();
+    }
+
+    /** The app excludes itself from its VPN. Its default network is selected by
+     * Android, not by guessed Wi-Fi/cellular priorities. Callbacks never query
+     * synchronous connectivity APIs (their results may race callback events). */
+    private void startNetworkMonitor(int token) throws IOException {
+        connectivity = getSystemService(ConnectivityManager.class);
+        if (connectivity == null) throw new IOException("系统网络状态服务不可用");
+        ConnectivityManager.NetworkCallback callback = new ConnectivityManager.NetworkCallback() {
+            @Override public void onAvailable(Network n) { changeRoute(token, () -> networkState.available(n)); }
+            @Override public void onCapabilitiesChanged(Network n, NetworkCapabilities c) {
+                boolean eligible = c.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                        && c.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                        && !c.hasTransport(NetworkCapabilities.TRANSPORT_VPN);
+                changeRoute(token, () -> networkState.capabilities(n, eligible));
+            }
+            @Override public void onLinkPropertiesChanged(Network n, LinkProperties p) {
+                // In-memory comparison only. Never persist interface/IP/DNS details.
+                changeRoute(token, () -> networkState.links(n, p.toString()));
+            }
+            @Override public void onBlockedStatusChanged(Network n, boolean blocked) {
+                changeRoute(token, () -> networkState.blocked(n, blocked));
+            }
+            @Override public void onLost(Network n) { changeRoute(token, () -> networkState.lost(n)); }
+        };
+        synchronized (networkState) {
+            if (!active(token)) return;
+            networkCallback = callback;
+            prefs.edit().putString("dnsNetworkState", "waiting").apply();
+            connectivity.registerDefaultNetworkCallback(callback);
+        }
+    }
+
+    private void changeRoute(int token, Runnable event) {
+        final DnsUpstream previous;
+        final long epoch;
+        synchronized (networkState) {
+            if (!active(token)) return;
+            NetworkEpoch.Snapshot<Network> before = networkState.snapshot();
+            event.run();
+            NetworkEpoch.Snapshot<Network> route = networkState.snapshot();
+            if (route == before) return;
+            epoch = route.epoch;
+            previous = encryptedUpstream;
+            encryptedUpstream = route.network != null && "doh".equals(activeTransport)
+                    ? new DnsUpstream(url -> (HttpsURLConnection)route.network.openConnection(url, Proxy.NO_PROXY)) : null;
+            cache.clear();
+            prefs.edit().putString("dnsNetworkState", route.status).remove("dnsLastError").apply();
+        }
+        // Closing transport resources can do I/O: keep it off Android's callback thread.
+        Runnable cleanup = () -> {
+            if (previous != null) previous.close();
+            for (java.util.Map.Entry<Closeable, Long> item : sockets.entrySet()) {
+                if (item.getValue() < epoch && sockets.remove(item.getKey(), item.getValue()))
+                    try { item.getKey().close(); } catch (IOException ignored) { }
+            }
+            synchronized (networkState) {
+                if (active(token)) {
+                    NetworkEpoch.Snapshot<Network> latest = networkState.snapshot();
+                    try {
+                        if (!setUnderlyingNetworks(latest.network == null ? new Network[0] : new Network[]{latest.network}))
+                            prefs.edit().putString("dnsNetworkReportError", "系统未确认 VPN 上游网络报告").apply();
+                        else prefs.edit().remove("dnsNetworkReportError").apply();
+                    } catch (RuntimeException error) {
+                        prefs.edit().putString("dnsNetworkReportError", "上游网络报告失败：" + message(error)).apply();
+                    }
+                    showForeground("ready".equals(latest.status) ? "DNS 防护已开启 · 普通网络流量直接连接"
+                            : "blocked".equals(latest.status) ? "DNS 防护运行中 · 系统限制上游联网" : "DNS 防护运行中 · 等待网络恢复");
+                }
+            }
+        };
+        try { lifecycle.execute(cleanup); }
+        catch (RejectedExecutionException stopped) { cleanup.run(); }
+    }
+
+    private boolean routeActive(int token, NetworkEpoch.Snapshot<Network> route) {
+        return active(token) && route.network != null && networkState.isCurrent(route);
+    }
+
+    /** Network switch and successful response accounting share one boundary.
+     * Stale responses are neither cached, counted as allowed, nor CNAME-filtered. */
+    private void replyAnswer(DnsPacket.Query query, byte[] answer, int token, NetworkEpoch.Snapshot<Network> route,
+                             String revision, long started, boolean cached, boolean fallback) throws IOException {
+        synchronized (networkState) {
+            if (!active(token)) return;
+            if (!routeActive(token, route)) { replyFailure(query, token, "network_changed"); return; }
+            if (replyBlockedIfNeeded(query, token) || replyAliasBlockedIfNeeded(query, answer, token)) return;
+            if (cached) cacheHits.incrementAndGet();
+            else {
+                if (fallback) fallbackCount.incrementAndGet();
+                long elapsed = Math.max(1, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started));
+                latencyMs.updateAndGet(previous -> previous == 0 ? elapsed : (previous * 7 + elapsed) / 8);
+                if (revision.equals(rules.currentRevision())) cache.put(query, answer, token + ":" + route.epoch + ":" + revision);
+                prefs.edit().remove("dnsLastError").apply();
+            }
+            record(query.domain, cached ? "cached" : fallback ? "fallback" : "allowed");
+            writePacket(DnsPacket.responsePacket(query, answer), token);
+        }
+    }
+
+    public static void clearRequestLogs(Context context) {
+        synchronized (LOGS_LOCK) { context.getSharedPreferences("bichen", Context.MODE_PRIVATE).edit().putString("dnsLogs", "[]").apply(); }
+    }
+    public static void setRequestLogging(Context context, boolean enabled) {
+        synchronized (LOGS_LOCK) { context.getSharedPreferences("bichen", Context.MODE_PRIVATE).edit().putBoolean("requestLogs", enabled).apply(); }
     }
 
     /** Record restoration intent before changing persistent module state, including failed starts. */
@@ -212,18 +329,21 @@ public final class DnsVpnService extends VpnService {
                     writePacket(DnsPacket.responsePacket(query, DnsPacket.error(query, 3)), token);
                     continue;
                 }
-                byte[] cached = cache.get(query, token + ":" + rules.currentRevision());
+                NetworkEpoch.Snapshot<Network> route = networkState.snapshot();
+                if (route.network == null) { replyFailure(query, token, "offline"); continue; }
+                byte[] cached;
+                synchronized (networkState) {
+                    cached = routeActive(token, route) ? cache.get(query, token + ":" + route.epoch + ":" + rules.currentRevision()) : null;
+                }
                 if (cached != null) {
-                    // A user can edit rules while the reader is between these operations.
-                    if (replyBlockedIfNeeded(query, token)) continue;
-                    cacheHits.incrementAndGet(); record(query.domain, "cached");
-                    writePacket(DnsPacket.responsePacket(query, cached), token);
+                    try { replyAnswer(query, cached, token, route, "", 0, true, false); }
+                    catch (IOException invalid) { cache.clear(); replyFailure(query, token, "invalid_response"); }
                     continue;
                 }
                 ThreadPoolExecutor pool = workers;
                 try {
                     if (pool == null) throw new RejectedExecutionException();
-                    pool.execute(() -> forward(query, token));
+                    pool.execute(() -> forward(query, token, route));
                 } catch (RejectedExecutionException e) {
                     if (active(token)) replyFailure(query, token, "busy");
                 }
@@ -237,21 +357,27 @@ public final class DnsVpnService extends VpnService {
 
     private boolean active(int token) { return networkRunning && !requestedStop && !destroyed && generation.get() == token; }
 
-    private void forward(DnsPacket.Query query, int token) {
+    private void forward(DnsPacket.Query query, int token, NetworkEpoch.Snapshot<Network> route) {
         if (!active(token)) return;
         if (replyBlockedIfNeeded(query, token)) return;
+        if (!routeActive(token, route)) { replyFailure(query, token, "network_changed"); return; }
         String revision = rules.currentRevision();
         long started = System.nanoTime();
         try {
             byte[] answer;
             boolean fallback = false;
             if ("doh".equals(activeTransport)) {
-                DnsUpstream https = encryptedUpstream;
+                DnsUpstream https;
+                synchronized (networkState) {
+                    if (!routeActive(token, route)) { replyFailure(query, token, "network_changed"); return; }
+                    https = encryptedUpstream;
+                }
                 if (https == null) throw new IOException("加密 DNS 上游尚未初始化");
                 String first = activeDohProvider;
                 try { answer = requireUsable(https.exchange(query, first)); }
                 catch (IOException firstFailure) {
                     if (!active(token)) return;
+                    if (!routeActive(token, route)) { replyFailure(query, token, "network_changed"); return; }
                     fallback = true;
                     String alternate = "cloudflare".equals(first) ? "google" : "cloudflare";
                     try { answer = requireUsable(https.exchange(query, alternate)); }
@@ -260,30 +386,24 @@ public final class DnsVpnService extends VpnService {
             } else {
                 InetAddress first = activeUpstream;
                 if (first == null) throw new IOException("DNS 上游尚未初始化");
-                try { answer = requireUsable(exchange(query, first, token)); }
+                try { answer = requireUsable(exchange(query, first, token, route)); }
                 catch (IOException firstFailure) {
                     if (!active(token)) return;
+                    if (!routeActive(token, route)) { replyFailure(query, token, "network_changed"); return; }
                     fallback = true;
                     InetAddress alternate = numericAddress("1.1.1.1");
                     if (first.equals(alternate)) alternate = numericAddress("223.5.5.5");
-                    try { answer = requireUsable(exchange(query, alternate, token)); }
+                    try { answer = requireUsable(exchange(query, alternate, token, route)); }
                     catch (IOException secondFailure) { throw new IOException("两路普通 DNS 均失败：" + message(firstFailure) + "；" + message(secondFailure)); }
                 }
             }
-            if (!active(token)) return;
-            if (replyBlockedIfNeeded(query, token)) return;
-            if (fallback) fallbackCount.incrementAndGet();
-            long elapsed = Math.max(1, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started));
-            // Exponential moving average (1/8 weight); cached/block decisions are excluded.
-            latencyMs.updateAndGet(previous -> previous == 0 ? elapsed : (previous * 7 + elapsed) / 8);
-            if (revision.equals(rules.currentRevision())) cache.put(query, answer, token + ":" + revision);
-            prefs.edit().remove("dnsLastError").apply();
-            record(query.domain, fallback ? "fallback" : "allowed");
-            writePacket(DnsPacket.responsePacket(query, answer), token);
+            replyAnswer(query, answer, token, route, revision, started, false, fallback);
         } catch (Exception e) {
-            if (active(token)) {
-                prefs.edit().putString("dnsLastError", message(e)).apply();
-                replyFailure(query, token, "failed");
+            synchronized (networkState) {
+                if (active(token)) {
+                    if (!routeActive(token, route)) replyFailure(query, token, "network_changed");
+                    else { prefs.edit().putString("dnsLastError", message(e)).apply(); replyFailure(query, token, "failed"); }
+                }
             }
         }
     }
@@ -303,6 +423,16 @@ public final class DnsVpnService extends VpnService {
         return true;
     }
 
+    private boolean replyAliasBlockedIfNeeded(DnsPacket.Query query, byte[] answer, int token) throws IOException {
+        String target = rules.blockedAlias(query, answer, prefs.getBoolean("cnameProtection", false));
+        if (target == null) return false;
+        if (active(token)) {
+            blocked.incrementAndGet(); record(query.domain, "blocked_cname", target);
+            writePacket(DnsPacket.responsePacket(query, DnsPacket.error(query, 3)), token);
+        }
+        return true;
+    }
+
     public static InetAddress numericAddress(String value) throws IOException {
         if (value == null || value.length() == 0 || value.length() > 64 || !value.matches("[0-9a-fA-F:.]+"))
             throw new IOException("上游 DNS 必须是数字 IP 地址");
@@ -317,16 +447,17 @@ public final class DnsVpnService extends VpnService {
         return InetAddress.getByName(value);
     }
 
-    private byte[] exchange(DnsPacket.Query query, InetAddress upstream, int token) throws IOException {
+    private byte[] exchange(DnsPacket.Query query, InetAddress upstream, int token, NetworkEpoch.Snapshot<Network> route) throws IOException {
         try (DatagramSocket socket = new DatagramSocket()) {
-            sockets.add(socket);
+            sockets.put(socket, route.epoch);
             try {
-                if (!active(token) || !protect(socket)) throw new IOException("无法保护 DNS 上游连接");
+                if (!routeActive(token, route) || !protect(socket)) throw new IOException("无法保护 DNS 上游连接");
+                route.network.bindSocket(socket);
                 socket.connect(upstream, 53);
                 socket.send(new DatagramPacket(query.dns, query.dns.length));
                 long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(1800);
                 byte[] received = new byte[DnsPacket.MAX_DNS + 1];
-                while (active(token)) {
+                while (routeActive(token, route)) {
                     int left = (int)TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime());
                     if (left <= 0) throw new IOException("DNS 上游超时");
                     socket.setSoTimeout(Math.max(1, left));
@@ -334,7 +465,7 @@ public final class DnsVpnService extends VpnService {
                     socket.receive(packet);
                     byte[] answer = Arrays.copyOf(received, packet.getLength());
                     if (!DnsPacket.validResponse(query, answer)) continue;
-                    if (DnsPacket.truncated(answer)) return exchangeTcp(query, upstream, token);
+                    if (DnsPacket.truncated(answer)) return exchangeTcp(query, upstream, token, route);
                     if (DnsPacket.ttlOffsets(answer) == null) continue;
                     return answer;
                 }
@@ -343,11 +474,12 @@ public final class DnsVpnService extends VpnService {
         }
     }
 
-    private byte[] exchangeTcp(DnsPacket.Query query, InetAddress upstream, int token) throws IOException {
+    private byte[] exchangeTcp(DnsPacket.Query query, InetAddress upstream, int token, NetworkEpoch.Snapshot<Network> route) throws IOException {
         try (Socket socket = new Socket()) {
-            sockets.add(socket);
+            sockets.put(socket, route.epoch);
             try {
-                if (!active(token) || !protect(socket)) throw new IOException("无法保护 DNS TCP 连接");
+                if (!routeActive(token, route) || !protect(socket)) throw new IOException("无法保护 DNS TCP 连接");
+                route.network.bindSocket(socket);
                 long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(2500);
                 socket.connect(new InetSocketAddress(upstream, 53), 1500);
                 socket.getOutputStream().write(new byte[]{(byte)(query.dns.length >>> 8), (byte)query.dns.length});
@@ -375,6 +507,7 @@ public final class DnsVpnService extends VpnService {
     }
 
     private void replyFailure(DnsPacket.Query query, int token, String reason) {
+        if (!active(token)) return;
         errors.incrementAndGet(); record(query.domain, reason);
         writePacket(DnsPacket.responsePacket(query, DnsPacket.error(query, 2)), token);
     }
@@ -387,14 +520,16 @@ public final class DnsVpnService extends VpnService {
         }
     }
 
-    private void record(String domain, String outcome) {
+    private void record(String domain, String outcome) { record(domain, outcome, ""); }
+
+    private void record(String domain, String outcome, String matchedDomain) {
         if (!prefs.getBoolean("requestLogs", false)) return;
-        synchronized (logsLock) {
+        synchronized (LOGS_LOCK) {
             try {
                 if (!prefs.getBoolean("requestLogs", false)) return;
                 JSONArray previous = new JSONArray(prefs.getString("dnsLogs", "[]")), next = new JSONArray();
                 for (int i = Math.max(0, previous.length() - 99); i < previous.length(); i++) next.put(previous.get(i));
-                next.put(new JSONObject().put("time", System.currentTimeMillis()).put("domain", domain).put("result", outcome));
+                next.put(new JSONObject().put("time", System.currentTimeMillis()).put("domain", domain).put("result", outcome).put("matchedDomain", matchedDomain));
                 prefs.edit().putString("dnsLogs", next.toString()).apply();
             } catch (Exception ignored) { }
         }
@@ -407,13 +542,17 @@ public final class DnsVpnService extends VpnService {
 
     private void closeNetwork() {
         networkRunning = false; if (latestInstance == this) running = false; generation.incrementAndGet();
+        ConnectivityManager.NetworkCallback callback;
+        synchronized (networkState) { callback = networkCallback; networkCallback = null; networkState.reset(); }
+        if (callback != null && connectivity != null) try { connectivity.unregisterNetworkCallback(callback); } catch (RuntimeException ignored) { }
+        if (prefs != null) prefs.edit().putString("dnsNetworkState", "stopped").apply();
         synchronized (outputLock) {
             // ParcelFileDescriptor owns the shared descriptor. Do not close wrappers twice.
             output = null;
             ParcelFileDescriptor old = tunnel; tunnel = null;
             if (old != null) try { old.close(); } catch (IOException ignored) { }
         }
-        for (Closeable socket : sockets) try { socket.close(); } catch (IOException ignored) { }
+        for (Closeable socket : sockets.keySet()) try { socket.close(); } catch (IOException ignored) { }
         sockets.clear();
         DnsUpstream https = encryptedUpstream; encryptedUpstream = null;
         if (https != null) https.close();
